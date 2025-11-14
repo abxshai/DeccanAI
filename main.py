@@ -5,6 +5,7 @@ import os
 import time
 import json
 import random
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from pathlib import Path
@@ -96,14 +97,37 @@ def process_single_url(url: str, agent, timeout: int, retries: int = MAX_EXTRACT
             break
         except Exception as e:
             if attempt == retries:
-                # fallback: fetch page text and try again if possible
+                # fallback: fetch page and save to temp file, then try extracting from file
                 if session is not None:
+                    tmp_path = None
                     try:
                         resp = session.get(url, timeout=timeout)
                         resp.raise_for_status()
-                        page_text = resp.text
+                        
+                        # Detect content type
+                        content_type = resp.headers.get('content-type', '').lower()
+                        
+                        # Save to appropriate temp file
+                        if 'pdf' in content_type:
+                            suffix = '.pdf'
+                        elif 'html' in content_type or 'text' in content_type:
+                            suffix = '.html'
+                        else:
+                            # Try to infer from URL
+                            if url.lower().endswith('.pdf'):
+                                suffix = '.pdf'
+                            else:
+                                suffix = '.html'
+                        
+                        # Create temp file
+                        tmp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix=suffix)
+                        tmp_file.write(resp.content)
+                        tmp_file.close()
+                        tmp_path = tmp_file.name
+                        
+                        # Try extraction from file
                         try:
-                            extraction_result = agent.extract(page_text)
+                            extraction_result = agent.extract(tmp_path)
                             result["status"] = "success"
                             result["data"] = extraction_result.data if hasattr(extraction_result, "data") else str(extraction_result)
                         except Exception as e2:
@@ -112,6 +136,13 @@ def process_single_url(url: str, agent, timeout: int, retries: int = MAX_EXTRACT
                     except Exception as e3:
                         result["status"] = "error"
                         result["error"] = f"Extract + fallback failed: {str(e3)[:300]}"
+                    finally:
+                        # Clean up temp file
+                        if tmp_path and os.path.exists(tmp_path):
+                            try:
+                                os.unlink(tmp_path)
+                            except:
+                                pass
                 else:
                     result["status"] = "error"
                     result["error"] = f"Extract error: {str(e)[:300]}"
@@ -315,6 +346,7 @@ if st.session_state.get("pdf_links"):
                                 break
 
                     st.success("Processing loop finished (or stopped).")
+                    st.session_state.processing = False
                 except Exception as e:
                     st.error(f"Processing loop failed: {e}")
                     st.session_state.processing = False
@@ -325,6 +357,7 @@ if not st.session_state.get("processing", False):
         st.session_state.pdf_links = []
         st.session_state.extraction_results = []
         st.success("Cleared in-memory results")
+        st.rerun()
 
 # -----------------------
 # Results display (merged persisted + in-memory)
