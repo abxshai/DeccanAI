@@ -1,12 +1,10 @@
-# streamlit_concurrent_extractor.py
+# streamlit_concurrent_extractor_fixed.py
 import streamlit as st
 import pandas as pd
 import os
 import time
 import json
-import tempfile
 import random
-import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from pathlib import Path
@@ -15,27 +13,26 @@ from requests.adapters import HTTPAdapter, Retry
 from llama_cloud_services import LlamaExtract
 
 # -----------------------
-# Config / constants
+# Constants / config
 # -----------------------
-PERSIST_FILE = Path("extraction_results.jsonl")  # append-only results for resume
-MAX_DOWNLOAD_RETRIES = 3
+PERSIST_FILE = Path("extraction_results.jsonl")
 MAX_EXTRACT_RETRIES = 3
 BACKOFF_BASE = 1.8
 DEFAULT_CONCURRENCY = 10
-RESULTS_FLUSH_EVERY = 5  # flush to disk every N results (we append per result anyway)
 
 st.set_page_config(page_title="Concurrent Web Extractor", layout="wide")
-st.title("🚀 Concurrent Web Extraction (URLs) — Fast mode")
+st.title("🚀 Concurrent Web Extraction (URLs) — Fixed rerun behaviour")
 
 # -----------------------
-# Utilities: persistence / requests session
+# Helpers: persistence / requests session
 # -----------------------
 def append_result_to_disk(res: dict):
-    """Append a single JSON line to disk (atomic-ish)."""
+    """Append a single JSON line to disk."""
     try:
         with PERSIST_FILE.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(res, default=str) + "\n")
     except Exception as e:
+        # Don't crash the app if disk write fails; show message later
         st.error(f"Failed to persist result: {e}")
 
 def load_persisted_results():
@@ -65,24 +62,18 @@ def make_requests_session():
 # -----------------------
 @st.cache_resource
 def get_extraction_agent(agent_name: str):
-    """
-    Initialize and cache the LlamaExtract extractor/agent.
-    This runs once per name.
-    """
     api_key = os.environ.get("LLAMA_CLOUD_API_KEY", "")
     if not api_key:
-        # we don't raise here to allow sidebar to set env var first
         return None
     try:
         extractor = LlamaExtract()
         agent = extractor.get_agent(name=agent_name)
         return agent
-    except Exception as e:
-        # Return None and let caller handle error display
+    except Exception:
         return None
 
 # -----------------------
-# Worker: process single URL (with retries)
+# Worker: process single URL (with retries/backoff)
 # -----------------------
 def backoff_sleep(attempt: int):
     jitter = random.uniform(0, 0.3)
@@ -90,10 +81,6 @@ def backoff_sleep(attempt: int):
     time.sleep(sleep_for)
 
 def process_single_url(url: str, agent, timeout: int, retries: int = MAX_EXTRACT_RETRIES, session: Optional[requests.Session] = None, metadata: Optional[dict] = None):
-    """
-    Attempts to call agent.extract(url). Retries extraction on exception with backoff.
-    Returns a result dict that will be appended to results list/disk.
-    """
     result = {
         "url": url,
         "status": "pending",
@@ -101,36 +88,30 @@ def process_single_url(url: str, agent, timeout: int, retries: int = MAX_EXTRACT
         "started_at": time.time()
     }
 
-    # First: try to call agent.extract(url) directly (most agents accept URL)
     for attempt in range(1, retries + 1):
         try:
-            extraction_result = agent.extract(url)  # primary path
-            # normalize result
+            extraction_result = agent.extract(url)
             result["status"] = "success"
             result["data"] = extraction_result.data if hasattr(extraction_result, "data") else str(extraction_result)
             break
         except Exception as e:
-            # If extraction fails and we still have retries, backoff and retry.
             if attempt == retries:
-                # Final failure: attempt a fallback: fetch page ourselves and pass raw text if possible
-                # Only attempt fallback if we have a requests session
+                # fallback: fetch page text and try again if possible
                 if session is not None:
                     try:
-                        # Try to download page HTML/text and send as plain text to agent.extract
                         resp = session.get(url, timeout=timeout)
                         resp.raise_for_status()
                         page_text = resp.text
-                        # Second fallback: try agent.extract on page_text (some agents accept plain text)
                         try:
                             extraction_result = agent.extract(page_text)
                             result["status"] = "success"
                             result["data"] = extraction_result.data if hasattr(extraction_result, "data") else str(extraction_result)
                         except Exception as e2:
                             result["status"] = "error"
-                            result["error"] = f"Extract failed after fallbacks: {str(e2)[:300]}"
+                            result["error"] = f"Extract failed after fallback: {str(e2)[:300]}"
                     except Exception as e3:
                         result["status"] = "error"
-                        result["error"] = f"Extract error and fallback failed: {str(e3)[:300]}"
+                        result["error"] = f"Extract + fallback failed: {str(e3)[:300]}"
                 else:
                     result["status"] = "error"
                     result["error"] = f"Extract error: {str(e)[:300]}"
@@ -142,7 +123,7 @@ def process_single_url(url: str, agent, timeout: int, retries: int = MAX_EXTRACT
     return result
 
 # -----------------------
-# Streamlit UI: Sidebar config
+# Sidebar config
 # -----------------------
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -164,19 +145,19 @@ with st.sidebar:
 st.subheader("📥 Upload CSV with URL column (url / link / URL / Link)")
 uploaded_csv = st.file_uploader("CSV file", type=["csv"])
 
-# Load persisted results (resume)
-persisted = load_persisted_results()
-if persisted and "resumed_once" not in st.session_state:
-    # load persisted into session if not already loaded
-    st.session_state.extraction_results = persisted
-    st.session_state.resumed_once = True
-
-if "extraction_results" not in st.session_state:
-    st.session_state.extraction_results = []
+# Load persisted results into session_state once (resume)
+if "persisted_loaded" not in st.session_state:
+    persisted = load_persisted_results()
+    if persisted:
+        st.session_state.extraction_results = persisted.copy()
+    else:
+        st.session_state.extraction_results = []
+    st.session_state.persisted_loaded = True
 
 if "pdf_links" not in st.session_state:
     st.session_state.pdf_links = []
 
+# Button handler: Load links
 if uploaded_csv is not None:
     try:
         df = pd.read_csv(uploaded_csv)
@@ -191,44 +172,52 @@ if uploaded_csv is not None:
             st.success(f"Found {len(df)} rows in column '{url_column}'")
             st.dataframe(df.head(10), use_container_width=True)
             if st.button("Load links into session"):
+                # load links
                 st.session_state.pdf_links = []
-                st.session_state.extraction_results = []  # clear in-memory; persisted results remain
+                # keep persisted results (so we can resume) but clear in-memory extraction results if desired
+                st.session_state.extraction_results = st.session_state.get("extraction_results", [])
                 for _, row in df.iterrows():
                     u = row[url_column]
                     if pd.notna(u):
                         metadata = {c: str(row[c]) for c in df.columns if c != url_column and pd.notna(row[c])}
                         st.session_state.pdf_links.append({"url": str(u).strip(), "metadata": metadata, "status": "pending"})
                 st.success(f"Loaded {len(st.session_state.pdf_links)} links")
-                st.experimental_rerun()
+                # safe rerun inside button callback
+                st.rerun()
     except Exception as e:
         st.error(f"Failed to read CSV: {e}")
 
-# Merge persisted results into display (dedupe by URL)
+# -----------------------
+# Resume / clear persisted controls (button callbacks only)
+# -----------------------
+colA, colB = st.columns(2)
+with colA:
+    if st.button("Resume persisted results (reload from disk)"):
+        st.session_state.extraction_results = load_persisted_results()
+        st.success("Reloaded persisted results")
+        st.rerun()
+with colB:
+    if st.button("Clear persisted results (delete file)"):
+        try:
+            if PERSIST_FILE.exists():
+                PERSIST_FILE.unlink()
+            st.session_state.extraction_results = []
+            st.success("Deleted persisted file and cleared results")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to delete file: {e}")
+
+# -----------------------
+# Utility: processed URLs set
+# -----------------------
 def get_processed_urls():
     processed = set()
     for r in st.session_state.extraction_results:
         processed.add(r.get("url"))
     return processed
 
-# Buttons to resume persisted work
-colA, colB = st.columns(2)
-with colA:
-    if st.button("Resume persisted results (reload from disk)"):
-        st.session_state.extraction_results = load_persisted_results()
-        st.success("Reloaded persisted results")
-        st.experimental_rerun()
-with colB:
-    if st.button("Clear persisted results (delete file)"):
-        try:
-            if PERSIST_FILE.exists():
-                PERSIST_FILE.unlink()
-            st.success("Deleted persisted file")
-            st.experimental_rerun()
-        except Exception as e:
-            st.error(f"Failed to delete file: {e}")
-
 # -----------------------
-# Processing controls
+# Processing controls & orchestration
 # -----------------------
 if st.session_state.get("pdf_links"):
     st.divider()
@@ -249,25 +238,27 @@ if st.session_state.get("pdf_links"):
     if "processing" not in st.session_state:
         st.session_state.processing = False
 
+    # Start button (safe rerun in callback)
     if not st.session_state.processing:
         if st.button("Start (concurrent)", type="primary"):
             st.session_state.processing = True
-            st.experimental_rerun()
+            st.rerun()
 
+    # Stop button (safe rerun in callback)
     if st.session_state.processing:
         if st.button("Stop processing (stop after current tasks)"):
             st.session_state.processing = False
             st.warning("Processing will stop after current active tasks finish.")
-            st.experimental_rerun()
+            st.rerun()
 
-    # Only start worker orchestration if processing flag is set
+    # Only run processing logic when processing flag is True
     if st.session_state.processing:
+        # Initialize agent
         agent = get_extraction_agent(agent_name)
         if agent is None:
             st.error("Agent not initialized. Set LLAMA_CLOUD_API_KEY in sidebar and ensure agent name is correct.")
             st.session_state.processing = False
         else:
-            # Build list of pending link dicts excluding already processed (persisted or in-memory)
             processed_set = get_processed_urls()
             pending = [p for p in st.session_state.pdf_links if p["url"] not in processed_set]
             total_pending = len(pending)
@@ -275,24 +266,18 @@ if st.session_state.get("pdf_links"):
             if total_pending == 0:
                 st.success("No pending links to process.")
                 st.session_state.processing = False
-                st.experimental_rerun()
             else:
                 st.info(f"Processing {total_pending} pending links with {concurrency} workers...")
                 progress_bar = st.progress(0.0)
                 status_text = st.empty()
 
-                # create requests session for workers
                 session = make_requests_session()
-
-                # We'll submit tasks in chunks to avoid submitting all at once for very large lists.
-                chunk_size = max(concurrency * 5, 50)  # tune: how many tasks we queue at once
+                chunk_size = max(concurrency * 5, 50)
                 submitted = 0
-                results_this_run = []
 
                 try:
                     with ThreadPoolExecutor(max_workers=concurrency) as executor:
                         while submitted < total_pending and st.session_state.processing:
-                            # prepare next chunk of tasks
                             chunk = pending[submitted: submitted + chunk_size]
                             futures = {}
                             for item in chunk:
@@ -300,9 +285,7 @@ if st.session_state.get("pdf_links"):
                                 metadata = item.get("metadata", {})
                                 future = executor.submit(process_single_url, url, agent, timeout_seconds, MAX_EXTRACT_RETRIES, session, metadata)
                                 futures[future] = url
-                                # small jitter between task submissions to reduce bursts
                                 time.sleep(0.005)
-                            # wait for chunk results as they complete
                             for future in as_completed(futures):
                                 url = futures[future]
                                 try:
@@ -312,7 +295,6 @@ if st.session_state.get("pdf_links"):
                                 # append to session state & persist
                                 st.session_state.extraction_results.append(res)
                                 append_result_to_disk(res)
-                                results_this_run.append(res)
 
                                 # update UI metrics & progress
                                 processed_urls = get_processed_urls()
@@ -323,43 +305,35 @@ if st.session_state.get("pdf_links"):
                                 progress_bar.progress(min(1.0, overall_progress))
                                 status_text.text(f"Processed {processed_count}/{total} — Success: {completed_count} Fail: {failed_count}")
 
-                                # apply per-worker delay if configured
                                 if delay_between_requests > 0:
                                     time.sleep(delay_between_requests)
                             submitted += len(chunk)
-
-                            # small pause to allow interruption and avoid CPU spikes
                             time.sleep(0.2)
 
-                            # stop early if user toggled processing flag off in another tab/button
+                            # if user pressed Stop in another tab/button, break early
                             if not st.session_state.processing:
                                 break
 
-                    # finished chunking loop
-                    st.success("Batch run finished (or stopped).")
+                    st.success("Processing loop finished (or stopped).")
                 except Exception as e:
                     st.error(f"Processing loop failed: {e}")
                     st.session_state.processing = False
 
-                # Completed run - refresh UI
-                st.experimental_rerun()
-
-    # allow clearing in non-processing state
-    if not st.session_state.processing:
-        if st.button("Clear session results (in-memory only)"):
-            st.session_state.pdf_links = []
-            st.session_state.extraction_results = []
-            st.experimental_rerun()
+# allow clearing in non-processing state (in-memory only)
+if not st.session_state.get("processing", False):
+    if st.button("Clear session results (in-memory only)"):
+        st.session_state.pdf_links = []
+        st.session_state.extraction_results = []
+        st.success("Cleared in-memory results")
 
 # -----------------------
-# Results display (always shown, merged with persisted results)
+# Results display (merged persisted + in-memory)
 # -----------------------
 if st.session_state.extraction_results:
     st.divider()
     st.subheader("📊 Extraction Results (merged persisted + in-memory)")
-    # Merge and dedupe by URL: prefer latest in-memory record
+
     merged = {}
-    # load persisted first (so in-memory overrides)
     persisted_list = load_persisted_results()
     for r in persisted_list:
         merged[r.get("url")] = r
@@ -367,14 +341,12 @@ if st.session_state.extraction_results:
         merged[r.get("url")] = r
     results_list = list(merged.values())
 
-    # Build dataframe rows
     rows = []
     for r in results_list:
         row = {"URL": r.get("url"), "Status": "✅ Success" if r.get("status") == "success" else "❌ Error"}
         if r.get("status") == "success":
             data = r.get("data", {})
             if isinstance(data, dict):
-                # flatten keys into row but limit long text
                 for k, v in data.items():
                     if isinstance(v, (dict, list)):
                         row[k] = str(v)[:300]
@@ -384,7 +356,6 @@ if st.session_state.extraction_results:
                 row["Extracted_Data"] = str(data)[:300]
         else:
             row["Error"] = r.get("error", "")[:300]
-        # include metadata keys
         meta = r.get("metadata", {})
         for mk, mv in meta.items():
             row[mk] = mv
@@ -405,8 +376,7 @@ if st.session_state.extraction_results:
         if not failed_df.empty:
             failed_csv = failed_df[["URL", "Error"]].to_csv(index=False)
             st.download_button("Download Failed URLs", failed_csv, file_name=f"failed_{int(time.time())}.csv", mime="text/csv")
-
 else:
     st.info("Upload CSV and load links to start.")
 
-st.caption("Concurrent extractor — uses same cached LlamaExtract agent, ThreadPoolExecutor, retries, and persistence.")
+st.caption("Concurrent extractor (fixed). Uses cached LlamaExtract agent, ThreadPoolExecutor, retries, and persistence.")
