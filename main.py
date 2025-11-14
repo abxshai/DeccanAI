@@ -53,6 +53,15 @@ with st.sidebar:
     
     st.subheader("🚀 Processing Settings")
     
+    # --- NEW: Batch Size Slider ---
+    batch_size = st.slider(
+        "Batch Size",
+        min_value=1,
+        max_value=50,
+        value=5,
+        help="Number of PDFs to process in each batch. Lower values are more stable for long-running jobs."
+    )
+
     delay_between_requests = st.slider(
         "Delay Between Requests (seconds)",
         min_value=0.0,
@@ -85,9 +94,9 @@ with st.sidebar:
     Example CSV:
     ```
     url
-    https://example.com/doc1.pdf
-    https://example.com/doc2.pdf
-    https://example.com/doc3.pdf
+    [https://example.com/doc1.pdf](https://example.com/doc1.pdf)
+    [https://example.com/doc2.pdf](https://example.com/doc2.pdf)
+    [https://example.com/doc3.pdf](https://example.com/doc3.pdf)
     ```
     
     Optional columns:
@@ -96,8 +105,34 @@ with st.sidebar:
     - Any other metadata columns
     """)
 
-def process_single_pdf(url: str, agent_name: str, timeout: int, metadata: dict = None):
-    """Process a single PDF - creates fresh agent instance"""
+# --- NEW: Cached function to get the agent ---
+@st.cache_resource
+def get_extraction_agent(agent_name: str):
+    """
+    Initializes and caches the LlamaExtract agent.
+    This function will only run once per agent name.
+    """
+    if 'LLAMA_CLOUD_API_KEY' not in os.environ or not os.environ['LLAMA_CLOUD_API_KEY']:
+        st.error("❌ LLAMA_CLOUD_API_KEY not set. Please set it in the sidebar.")
+        return None
+    
+    try:
+        extractor = LlamaExtract()
+        agent = extractor.get_agent(name=agent_name)
+        if agent is None:
+            st.error(f'❌ Agent "{agent_name}" not found. Check the name in the sidebar.')
+            return None
+        st.success(f"✅ LlamaExtract Agent '{agent_name}' initialized.")
+        return agent
+    except Exception as e:
+        st.error(f"❌ Failed to initialize LlamaExtract agent: {e}")
+        return None
+
+# --- MODIFIED: process_single_pdf now accepts the agent ---
+def process_single_pdf(url: str, agent, timeout: int, metadata: dict = None):
+    """
+    Process a single PDF using the provided agent instance.
+    """
     result = {
         'url': url,
         'status': 'pending',
@@ -118,14 +153,7 @@ def process_single_pdf(url: str, agent_name: str, timeout: int, metadata: dict =
         tmp_file.close()
         tmp_path = tmp_file.name
         
-        # Create a fresh extractor and agent for this request
-        extractor = LlamaExtract()
-        agent = extractor.get_agent(name=agent_name)
-        
-        if agent is None:
-            result['status'] = 'error'
-            result['error'] = f'Agent "{agent_name}" not found'
-            return result
+        # --- REMOVED: Agent creation is now done once outside this function ---
         
         # Extract data
         extraction_result = agent.extract(tmp_path)
@@ -198,6 +226,7 @@ if uploaded_csv is not None:
             # Load links into session state
             if st.button("📥 Load Links for Processing", type="primary", use_container_width=True):
                 st.session_state.pdf_links = []
+                st.session_state.extraction_results = [] # Clear old results
                 for idx, row in df.iterrows():
                     url = row[url_column]
                     if pd.notna(url):
@@ -218,117 +247,127 @@ if st.session_state.pdf_links:
     st.divider()
     st.subheader("🚀 Process PDFs")
     
-    # Show statistics
+    # --- MODIFIED: Metrics are now calculated from the two state lists ---
+    total_links = len(st.session_state.pdf_links)
+    completed_results = [r for r in st.session_state.extraction_results if r['status'] == 'success']
+    failed_results = [r for r in st.session_state.extraction_results if r['status'] == 'error']
+    
+    completed_count = len(completed_results)
+    failed_count = len(failed_results)
+    processed_count = completed_count + failed_count
+    pending_count = total_links - processed_count
+
     col1, col2, col3, col4 = st.columns(4)
-    
-    pending = sum(1 for p in st.session_state.pdf_links if p['status'] == 'pending')
-    processing_status = sum(1 for p in st.session_state.pdf_links if p['status'] == 'processing')
-    completed = len([r for r in st.session_state.extraction_results if r['status'] == 'success'])
-    failed = len([r for r in st.session_state.extraction_results if r['status'] == 'error'])
-    
     with col1:
-        st.metric("Pending", pending)
+        st.metric("Total Links", total_links)
     with col2:
-        st.metric("Processing", processing_status)
+        st.metric("Pending", pending_count)
     with col3:
-        st.metric("Completed", completed)
+        st.metric("Completed", completed_count)
     with col4:
-        st.metric("Failed", failed)
+        st.metric("Failed", failed_count)
     
     if not st.session_state.processing:
-        if st.button("🚀 Start Extraction", type="primary", use_container_width=True, disabled=pending == 0):
+        if st.button("🚀 Start Extraction", type="primary", use_container_width=True, disabled=pending_count == 0):
             st.session_state.processing = True
             st.rerun()
     
+    # --- MODIFIED: This is now the main batch processing loop ---
     if st.session_state.processing:
-        st.info("⏳ Processing PDFs sequentially to avoid event loop conflicts...")
         
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        results_container = st.container()
-        
-        pending_links = [p for p in st.session_state.pdf_links if p['status'] == 'pending']
-        total = len(pending_links)
-        
-        if total == 0:
-            st.warning("No pending links to process")
-            st.session_state.processing = False
-            st.rerun()
-        
-        completed_count = 0
-        success_count = 0
-        error_count = 0
-        
-        for idx, link in enumerate(pending_links):
-            status_text.text(f"Processing {idx + 1}/{total}: {link['url'][:60]}...")
-            
-            for p in st.session_state.pdf_links:
-                if p['url'] == link['url']:
-                    p['status'] = 'processing'
-                    break
-            
-            try:
-                result = process_single_pdf(
-                    link['url'],
-                    agent_name,
-                    timeout_seconds,
-                    link['metadata']
-                )
-                
-                st.session_state.extraction_results.append(result)
-                
-                for p in st.session_state.pdf_links:
-                    if p['url'] == link['url']:
-                        p['status'] = result['status']
-                        break
-                
-                if result['status'] == 'success':
-                    success_count += 1
-                else:
-                    error_count += 1
-                    if not continue_on_error:
-                        st.error(f"❌ Stopped due to error: {result.get('error', 'Unknown error')}")
-                        break
-                
-            except Exception as e:
-                error_result = {
-                    'url': link['url'],
-                    'status': 'error',
-                    'error': f'Processing exception: {str(e)[:200]}',
-                    'metadata': link['metadata']
-                }
-                st.session_state.extraction_results.append(error_result)
-                error_count += 1
-                
-                if not continue_on_error:
-                    st.error(f"❌ Stopped due to exception: {str(e)}")
-                    break
-            
-            completed_count += 1
-            progress_bar.progress(completed_count / total)
-            
-            with results_container:
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Processed", completed_count)
-                with col2:
-                    st.metric("Success", success_count)
-                with col3:
-                    st.metric("Failed", error_count)
-            
-            if delay_between_requests > 0 and idx < total - 1:
-                time.sleep(delay_between_requests)
-        
-        st.success(f"✅ Processing complete! {success_count} successful, {error_count} failed")
-        st.session_state.processing = False
-        st.rerun()
-    
-    if st.session_state.processing:
+        # --- NEW: Add stop button here so it's responsive ---
         if st.button("⏸️ Stop Processing", use_container_width=True):
             st.session_state.processing = False
-            st.warning("⚠️ Processing stopped by user")
+            st.warning("⚠️ Processing will stop after this batch.")
             st.rerun()
-    
+
+        st.info("⏳ Processing PDFs in batches...")
+        
+        progress_bar = st.progress(processed_count / total_links if total_links > 0 else 0)
+        status_text = st.empty()
+        
+        # --- NEW: Get the cached agent ---
+        agent = get_extraction_agent(agent_name)
+        
+        if not agent:
+            st.error("Cannot process without a valid agent. Stopping.")
+            st.session_state.processing = False
+            st.rerun()
+
+        else:
+            # --- NEW: Get just the batch to process ---
+            pending_links_list = [p for p in st.session_state.pdf_links if p['status'] == 'pending']
+            
+            if not pending_links_list:
+                st.success(f"✅ Processing complete! {completed_count} successful, {failed_count} failed")
+                st.session_state.processing = False
+                st.rerun()
+            
+            else:
+                links_to_process = pending_links_list[:batch_size]
+                
+                status_text.text(f"Processing batch of {len(links_to_process)}... ({processed_count + 1} to {processed_count + len(links_to_process)} of {total_links})")
+                
+                batch_error = False
+                
+                for link in links_to_process:
+                    # Update status in main list to 'processing'
+                    for p in st.session_state.pdf_links:
+                        if p['url'] == link['url'] and p['status'] == 'pending':
+                            p['status'] = 'processing'
+                            break
+                    
+                    try:
+                        result = process_single_pdf(
+                            link['url'],
+                            agent, # Pass the cached agent
+                            timeout_seconds,
+                            link['metadata']
+                        )
+                        
+                        st.session_state.extraction_results.append(result)
+                        
+                        # Update status in main list to final status
+                        for p in st.session_state.pdf_links:
+                            if p['url'] == link['url'] and p['status'] == 'processing':
+                                p['status'] = result['status']
+                                break
+                        
+                        if result['status'] == 'error' and not continue_on_error:
+                            st.error(f"❌ Stopped due to error: {result.get('error', 'Unknown error')}")
+                            st.session_state.processing = False
+                            batch_error = True
+                            break
+                        
+                    except Exception as e:
+                        error_result = {
+                            'url': link['url'], 'status': 'error',
+                            'error': f'Batch exception: {str(e)[:200]}', 'metadata': link['metadata']
+                        }
+                        st.session_state.extraction_results.append(error_result)
+                        
+                        # Update status in main list
+                        for p in st.session_state.pdf_links:
+                            if p['url'] == link['url'] and p['status'] == 'processing':
+                                p['status'] = 'error'
+                                break
+                        
+                        if not continue_on_error:
+                            st.error(f"❌ Stopped due to exception: {str(e)}")
+                            st.session_state.processing = False
+                            batch_error = True
+                            break
+                    
+                    if delay_between_requests > 0:
+                        time.sleep(delay_between_requests)
+
+                # --- NEW: Rerun to process the next batch ---
+                if st.session_state.processing and not batch_error:
+                    st.rerun()
+                else:
+                    # Refresh the page to show final metrics and "Start" button
+                    st.rerun()
+
     if not st.session_state.processing:
         if st.button("🗑️ Clear All Results", use_container_width=True):
             st.session_state.pdf_links = []
@@ -360,7 +399,7 @@ if st.session_state.extraction_results:
                         row[key] = str(value)
                     else:
                         row[key] = value
-
+                
                 # ✅ Explicitly include key fields
                 row['University'] = data.get('university', '')
                 row['Company_Name'] = data.get('company_name', data.get('company', ''))
@@ -436,8 +475,10 @@ if st.session_state.extraction_results:
     with st.expander("🔍 View Raw Extraction Data"):
         st.json(st.session_state.extraction_results)
     
+    # --- This summary section is now redundant with the one at the top ---
+    # --- but we can keep it as a final summary ---
     st.divider()
-    st.subheader("📈 Summary Statistics")
+    st.subheader("📈 Final Summary Statistics")
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -460,4 +501,4 @@ else:
 
 # Footer
 st.divider()
-st.caption("Powered by LlamaExtract & Streamlit | Sequential processing to ensure stability")
+st.caption("Powered by LlamaExtract & Streamlit | Now with stable batch processing!")
