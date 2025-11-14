@@ -1,415 +1,504 @@
-# streamlit_concurrent_extractor_fixed.py
 import streamlit as st
 import pandas as pd
+from llama_cloud_services import LlamaExtract
+import requests
+import tempfile
 import os
 import time
-import json
-import random
-import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
-from pathlib import Path
-import requests
-from requests.adapters import HTTPAdapter, Retry
-from llama_cloud_services import LlamaExtract
+from typing import List, Dict
+import threading
+from queue import Queue
 
-# -----------------------
-# Constants / config
-# -----------------------
-PERSIST_FILE = Path("extraction_results.jsonl")
-MAX_EXTRACT_RETRIES = 3
-BACKOFF_BASE = 1.8
-DEFAULT_CONCURRENCY = 10
+# Page configuration
+st.set_page_config(
+    page_title="Bulk PDF Extraction Platform",
+    page_icon="📄",
+    layout="wide"
+)
 
-st.set_page_config(page_title="Concurrent Web Extractor", layout="wide")
-st.title("🚀 Concurrent Web Extraction (URLs) — Fixed rerun behaviour")
+# Initialize session state
+if 'extraction_results' not in st.session_state:
+    st.session_state.extraction_results = []
 
-# -----------------------
-# Helpers: persistence / requests session
-# -----------------------
-def append_result_to_disk(res: dict):
-    """Append a single JSON line to disk."""
-    try:
-        with PERSIST_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(res, default=str) + "\n")
-    except Exception as e:
-        # Don't crash the app if disk write fails; show message later
-        st.error(f"Failed to persist result: {e}")
+if 'pdf_links' not in st.session_state:
+    st.session_state.pdf_links = []
 
-def load_persisted_results():
-    results = []
-    if PERSIST_FILE.exists():
-        try:
-            with PERSIST_FILE.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        results.append(json.loads(line))
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-    return results
+if 'processing' not in st.session_state:
+    st.session_state.processing = False
 
-@st.cache_resource
-def make_requests_session():
-    s = requests.Session()
-    retries = Retry(total=3, backoff_factor=0.8, status_forcelist=[429, 500, 502, 503, 504])
-    s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.mount("http://", HTTPAdapter(max_retries=retries))
-    return s
+# Title and description
+st.title("📄 Bulk PDF Extraction Platform")
+st.markdown("Extract structured data from thousands of PDF documents using LlamaExtract")
 
-# -----------------------
-# Cached LlamaExtract agent
-# -----------------------
+# Sidebar for configuration
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    
+    agent_name = st.text_input(
+        "Agent Name",
+        value="Extraction agent1",
+        help="Name of your LlamaExtract agent"
+    )
+    
+    api_key = st.text_input(
+        "LLAMA_CLOUD_API_KEY",
+        type="password",
+        help="Your Llama Cloud API key (or set as environment variable)"
+    )
+    
+    if api_key:
+        os.environ['LLAMA_CLOUD_API_KEY'] = api_key
+    
+    st.divider()
+    
+    st.subheader("🚀 Processing Settings")
+    
+    # --- NEW: Batch Size Slider ---
+    batch_size = st.slider(
+        "Batch Size",
+        min_value=1,
+        max_value=50,
+        value=5,
+        help="Number of PDFs to process in each batch. Lower values are more stable for long-running jobs."
+    )
+
+    delay_between_requests = st.slider(
+        "Delay Between Requests (seconds)",
+        min_value=0.0,
+        max_value=5.0,
+        value=0.5,
+        step=0.1,
+        help="Add delay between extractions to avoid rate limits"
+    )
+    
+    timeout_seconds = st.number_input(
+        "Download Timeout (seconds)",
+        min_value=10,
+        max_value=300,
+        value=30,
+        help="Timeout for downloading each PDF"
+    )
+    
+    continue_on_error = st.checkbox(
+        "Continue on Error",
+        value=True,
+        help="Continue processing if individual PDFs fail"
+    )
+    
+    st.divider()
+    
+    st.header("📋 CSV Format")
+    st.markdown("""
+    **Required column:** `url` or `link`
+    
+    Example CSV:
+    ```
+    url
+    [https://example.com/doc1.pdf](https://example.com/doc1.pdf)
+    [https://example.com/doc2.pdf](https://example.com/doc2.pdf)
+    [https://example.com/doc3.pdf](https://example.com/doc3.pdf)
+    ```
+    
+    Optional columns:
+    - `id` - Document identifier
+    - `name` - Document name
+    - Any other metadata columns
+    """)
+
+# --- NEW: Cached function to get the agent ---
 @st.cache_resource
 def get_extraction_agent(agent_name: str):
-    api_key = os.environ.get("LLAMA_CLOUD_API_KEY", "")
-    if not api_key:
+    """
+    Initializes and caches the LlamaExtract agent.
+    This function will only run once per agent name.
+    """
+    if 'LLAMA_CLOUD_API_KEY' not in os.environ or not os.environ['LLAMA_CLOUD_API_KEY']:
+        st.error("❌ LLAMA_CLOUD_API_KEY not set. Please set it in the sidebar.")
         return None
+    
     try:
         extractor = LlamaExtract()
         agent = extractor.get_agent(name=agent_name)
+        if agent is None:
+            st.error(f'❌ Agent "{agent_name}" not found. Check the name in the sidebar.')
+            return None
+        st.success(f"✅ LlamaExtract Agent '{agent_name}' initialized.")
         return agent
-    except Exception:
+    except Exception as e:
+        st.error(f"❌ Failed to initialize LlamaExtract agent: {e}")
         return None
 
-# -----------------------
-# Worker: process single URL (with retries/backoff)
-# -----------------------
-def backoff_sleep(attempt: int):
-    jitter = random.uniform(0, 0.3)
-    sleep_for = (BACKOFF_BASE ** (attempt - 1)) + jitter
-    time.sleep(sleep_for)
-
-def process_single_url(url: str, agent, timeout: int, retries: int = MAX_EXTRACT_RETRIES, session: Optional[requests.Session] = None, metadata: Optional[dict] = None):
+# --- MODIFIED: process_single_pdf now accepts the agent ---
+def process_single_pdf(url: str, agent, timeout: int, metadata: dict = None):
+    """
+    Process a single PDF using the provided agent instance.
+    """
     result = {
-        "url": url,
-        "status": "pending",
-        "metadata": metadata or {},
-        "started_at": time.time()
+        'url': url,
+        'status': 'pending',
+        'metadata': metadata or {}
     }
-
-    for attempt in range(1, retries + 1):
-        try:
-            extraction_result = agent.extract(url)
-            result["status"] = "success"
-            result["data"] = extraction_result.data if hasattr(extraction_result, "data") else str(extraction_result)
-            break
-        except Exception as e:
-            if attempt == retries:
-                # fallback: fetch page and save to temp file, then try extracting from file
-                if session is not None:
-                    tmp_path = None
-                    try:
-                        resp = session.get(url, timeout=timeout)
-                        resp.raise_for_status()
-                        
-                        # Detect content type
-                        content_type = resp.headers.get('content-type', '').lower()
-                        
-                        # Save to appropriate temp file
-                        if 'pdf' in content_type:
-                            suffix = '.pdf'
-                        elif 'html' in content_type or 'text' in content_type:
-                            suffix = '.html'
-                        else:
-                            # Try to infer from URL
-                            if url.lower().endswith('.pdf'):
-                                suffix = '.pdf'
-                            else:
-                                suffix = '.html'
-                        
-                        # Create temp file
-                        tmp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix=suffix)
-                        tmp_file.write(resp.content)
-                        tmp_file.close()
-                        tmp_path = tmp_file.name
-                        
-                        # Try extraction from file
-                        try:
-                            extraction_result = agent.extract(tmp_path)
-                            result["status"] = "success"
-                            result["data"] = extraction_result.data if hasattr(extraction_result, "data") else str(extraction_result)
-                        except Exception as e2:
-                            result["status"] = "error"
-                            result["error"] = f"Extract failed after fallback: {str(e2)[:300]}"
-                    except Exception as e3:
-                        result["status"] = "error"
-                        result["error"] = f"Extract + fallback failed: {str(e3)[:300]}"
-                    finally:
-                        # Clean up temp file
-                        if tmp_path and os.path.exists(tmp_path):
-                            try:
-                                os.unlink(tmp_path)
-                            except:
-                                pass
-                else:
-                    result["status"] = "error"
-                    result["error"] = f"Extract error: {str(e)[:300]}"
-            else:
-                backoff_sleep(attempt)
-                continue
-
-    result["finished_at"] = time.time()
+    
+    tmp_path = None
+    
+    try:
+        # Download PDF
+        response = requests.get(url, timeout=timeout, stream=True)
+        response.raise_for_status()
+        
+        # Save to temporary file
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+        for chunk in response.iter_content(chunk_size=8192):
+            tmp_file.write(chunk)
+        tmp_file.close()
+        tmp_path = tmp_file.name
+        
+        # --- REMOVED: Agent creation is now done once outside this function ---
+        
+        # Extract data
+        extraction_result = agent.extract(tmp_path)
+        
+        # Store results
+        result['status'] = 'success'
+        result['data'] = extraction_result.data if hasattr(extraction_result, 'data') else str(extraction_result)
+        
+    except requests.exceptions.Timeout:
+        result['status'] = 'error'
+        result['error'] = 'Download timeout'
+    except requests.exceptions.RequestException as e:
+        result['status'] = 'error'
+        result['error'] = f'Download error: {str(e)[:200]}'
+    except Exception as e:
+        result['status'] = 'error'
+        result['error'] = f'Extraction error: {str(e)[:200]}'
+    
+    finally:
+        # Clean up temporary file
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+    
     return result
 
-# -----------------------
-# Sidebar config
-# -----------------------
-with st.sidebar:
-    st.header("⚙️ Settings")
-    agent_name = st.text_input("Agent Name", value="Extraction agent1")
-    api_key_input = st.text_input("LLAMA_CLOUD_API_KEY (or set env var)", type="password")
-    if api_key_input:
-        os.environ["LLAMA_CLOUD_API_KEY"] = api_key_input
+# Main content area
+st.subheader("📎 Upload CSV with PDF Links")
 
-    concurrency = st.slider("Concurrency (parallel workers)", min_value=1, max_value=50, value=DEFAULT_CONCURRENCY)
-    delay_between_requests = st.slider("Delay between requests (s) per worker", min_value=0.0, max_value=3.0, value=0.1, step=0.05)
-    timeout_seconds = st.number_input("Request timeout (s)", min_value=5, max_value=300, value=30)
-    continue_on_error = st.checkbox("Continue on individual error", value=True)
-    st.markdown("---")
-    st.markdown("Persistence: results saved to `extraction_results.jsonl` so you can resume after interruptions.")
+uploaded_csv = st.file_uploader(
+    "Choose a CSV file with PDF URLs",
+    type=['csv'],
+    help="CSV should contain a column named 'url' or 'link' with PDF URLs"
+)
 
-# -----------------------
-# Upload CSV / load URLs
-# -----------------------
-st.subheader("📥 Upload CSV with URL column (url / link / URL / Link)")
-uploaded_csv = st.file_uploader("CSV file", type=["csv"])
-
-# Load persisted results into session_state once (resume)
-if "persisted_loaded" not in st.session_state:
-    persisted = load_persisted_results()
-    if persisted:
-        st.session_state.extraction_results = persisted.copy()
-    else:
-        st.session_state.extraction_results = []
-    st.session_state.persisted_loaded = True
-
-if "pdf_links" not in st.session_state:
-    st.session_state.pdf_links = []
-
-# Button handler: Load links
 if uploaded_csv is not None:
     try:
+        # Read CSV
         df = pd.read_csv(uploaded_csv)
+        
+        # Find URL column
         url_column = None
-        for col in ["url", "link", "URL", "Link", "page_url"]:
+        for col in ['url', 'link', 'URL', 'Link', 'pdf_url', 'pdf_link']:
             if col in df.columns:
                 url_column = col
                 break
+        
         if url_column is None:
-            st.error("CSV must contain a column named 'url' or 'link'")
+            st.error("❌ CSV must contain a column named 'url' or 'link'")
         else:
-            st.success(f"Found {len(df)} rows in column '{url_column}'")
+            st.success(f"✅ Found {len(df)} PDF links in column '{url_column}'")
+            
+            # Show preview
+            st.subheader("📋 CSV Preview")
             st.dataframe(df.head(10), use_container_width=True)
-            if st.button("Load links into session"):
-                # load links
+            
+            # Show statistics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total PDFs", len(df))
+            with col2:
+                st.metric("Columns", len(df.columns))
+            with col3:
+                st.metric("Unique URLs", df[url_column].nunique())
+            with col4:
+                st.metric("Null URLs", df[url_column].isnull().sum())
+            
+            # Load links into session state
+            if st.button("📥 Load Links for Processing", type="primary", use_container_width=True):
                 st.session_state.pdf_links = []
-                # keep persisted results (so we can resume) but clear in-memory extraction results if desired
-                st.session_state.extraction_results = st.session_state.get("extraction_results", [])
-                for _, row in df.iterrows():
-                    u = row[url_column]
-                    if pd.notna(u):
-                        metadata = {c: str(row[c]) for c in df.columns if c != url_column and pd.notna(row[c])}
-                        st.session_state.pdf_links.append({"url": str(u).strip(), "metadata": metadata, "status": "pending"})
-                st.success(f"Loaded {len(st.session_state.pdf_links)} links")
-                # safe rerun inside button callback
+                st.session_state.extraction_results = [] # Clear old results
+                for idx, row in df.iterrows():
+                    url = row[url_column]
+                    if pd.notna(url):
+                        metadata = {col: str(row[col]) for col in df.columns if col != url_column and pd.notna(row[col])}
+                        st.session_state.pdf_links.append({
+                            'url': str(url),
+                            'metadata': metadata,
+                            'status': 'pending'
+                        })
+                st.success(f"✅ Loaded {len(st.session_state.pdf_links)} valid URLs")
                 st.rerun()
+    
     except Exception as e:
-        st.error(f"Failed to read CSV: {e}")
+        st.error(f"❌ Error reading CSV: {e}")
 
-# -----------------------
-# Resume / clear persisted controls (button callbacks only)
-# -----------------------
-colA, colB = st.columns(2)
-with colA:
-    if st.button("Resume persisted results (reload from disk)"):
-        st.session_state.extraction_results = load_persisted_results()
-        st.success("Reloaded persisted results")
-        st.rerun()
-with colB:
-    if st.button("Clear persisted results (delete file)"):
-        try:
-            if PERSIST_FILE.exists():
-                PERSIST_FILE.unlink()
-            st.session_state.extraction_results = []
-            st.success("Deleted persisted file and cleared results")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to delete file: {e}")
-
-# -----------------------
-# Utility: processed URLs set
-# -----------------------
-def get_processed_urls():
-    processed = set()
-    for r in st.session_state.extraction_results:
-        processed.add(r.get("url"))
-    return processed
-
-# -----------------------
-# Processing controls & orchestration
-# -----------------------
-if st.session_state.get("pdf_links"):
+# Processing section
+if st.session_state.pdf_links:
     st.divider()
-    st.subheader("🚀 Start concurrent extraction")
+    st.subheader("🚀 Process PDFs")
+    
+    # --- MODIFIED: Metrics are now calculated from the two state lists ---
+    total_links = len(st.session_state.pdf_links)
+    completed_results = [r for r in st.session_state.extraction_results if r['status'] == 'success']
+    failed_results = [r for r in st.session_state.extraction_results if r['status'] == 'error']
+    
+    completed_count = len(completed_results)
+    failed_count = len(failed_results)
+    processed_count = completed_count + failed_count
+    pending_count = total_links - processed_count
 
-    total = len(st.session_state.pdf_links)
-    processed_urls = get_processed_urls()
-    completed_count = len([r for r in st.session_state.extraction_results if r.get("status") == "success"])
-    failed_count = len([r for r in st.session_state.extraction_results if r.get("status") == "error"])
-    pending_count = total - len(processed_urls)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total", total)
-    c2.metric("Pending", pending_count)
-    c3.metric("Completed", completed_count)
-    c4.metric("Failed", failed_count)
-
-    if "processing" not in st.session_state:
-        st.session_state.processing = False
-
-    # Start button (safe rerun in callback)
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Links", total_links)
+    with col2:
+        st.metric("Pending", pending_count)
+    with col3:
+        st.metric("Completed", completed_count)
+    with col4:
+        st.metric("Failed", failed_count)
+    
     if not st.session_state.processing:
-        if st.button("Start (concurrent)", type="primary"):
+        if st.button("🚀 Start Extraction", type="primary", use_container_width=True, disabled=pending_count == 0):
             st.session_state.processing = True
             st.rerun()
-
-    # Stop button (safe rerun in callback)
+    
+    # --- MODIFIED: This is now the main batch processing loop ---
     if st.session_state.processing:
-        if st.button("Stop processing (stop after current tasks)"):
+        
+        # --- NEW: Add stop button here so it's responsive ---
+        if st.button("⏸️ Stop Processing", use_container_width=True):
             st.session_state.processing = False
-            st.warning("Processing will stop after current active tasks finish.")
+            st.warning("⚠️ Processing will stop after this batch.")
             st.rerun()
 
-    # Only run processing logic when processing flag is True
-    if st.session_state.processing:
-        # Initialize agent
+        st.info("⏳ Processing PDFs in batches...")
+        
+        progress_bar = st.progress(processed_count / total_links if total_links > 0 else 0)
+        status_text = st.empty()
+        
+        # --- NEW: Get the cached agent ---
         agent = get_extraction_agent(agent_name)
-        if agent is None:
-            st.error("Agent not initialized. Set LLAMA_CLOUD_API_KEY in sidebar and ensure agent name is correct.")
+        
+        if not agent:
+            st.error("Cannot process without a valid agent. Stopping.")
             st.session_state.processing = False
+            st.rerun()
+
         else:
-            processed_set = get_processed_urls()
-            pending = [p for p in st.session_state.pdf_links if p["url"] not in processed_set]
-            total_pending = len(pending)
-
-            if total_pending == 0:
-                st.success("No pending links to process.")
+            # --- NEW: Get just the batch to process ---
+            pending_links_list = [p for p in st.session_state.pdf_links if p['status'] == 'pending']
+            
+            if not pending_links_list:
+                st.success(f"✅ Processing complete! {completed_count} successful, {failed_count} failed")
                 st.session_state.processing = False
+                st.rerun()
+            
             else:
-                st.info(f"Processing {total_pending} pending links with {concurrency} workers...")
-                progress_bar = st.progress(0.0)
-                status_text = st.empty()
-
-                session = make_requests_session()
-                chunk_size = max(concurrency * 5, 50)
-                submitted = 0
-
-                try:
-                    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                        while submitted < total_pending and st.session_state.processing:
-                            chunk = pending[submitted: submitted + chunk_size]
-                            futures = {}
-                            for item in chunk:
-                                url = item["url"]
-                                metadata = item.get("metadata", {})
-                                future = executor.submit(process_single_url, url, agent, timeout_seconds, MAX_EXTRACT_RETRIES, session, metadata)
-                                futures[future] = url
-                                time.sleep(0.005)
-                            for future in as_completed(futures):
-                                url = futures[future]
-                                try:
-                                    res = future.result()
-                                except Exception as e:
-                                    res = {"url": url, "status": "error", "error": f"Worker exception: {e}", "metadata": {}}
-                                # append to session state & persist
-                                st.session_state.extraction_results.append(res)
-                                append_result_to_disk(res)
-
-                                # update UI metrics & progress
-                                processed_urls = get_processed_urls()
-                                completed_count = len([r for r in st.session_state.extraction_results if r.get("status") == "success"])
-                                failed_count = len([r for r in st.session_state.extraction_results if r.get("status") == "error"])
-                                processed_count = len(processed_urls)
-                                overall_progress = processed_count / total if total > 0 else 1.0
-                                progress_bar.progress(min(1.0, overall_progress))
-                                status_text.text(f"Processed {processed_count}/{total} — Success: {completed_count} Fail: {failed_count}")
-
-                                if delay_between_requests > 0:
-                                    time.sleep(delay_between_requests)
-                            submitted += len(chunk)
-                            time.sleep(0.2)
-
-                            # if user pressed Stop in another tab/button, break early
-                            if not st.session_state.processing:
+                links_to_process = pending_links_list[:batch_size]
+                
+                status_text.text(f"Processing batch of {len(links_to_process)}... ({processed_count + 1} to {processed_count + len(links_to_process)} of {total_links})")
+                
+                batch_error = False
+                
+                for link in links_to_process:
+                    # Update status in main list to 'processing'
+                    for p in st.session_state.pdf_links:
+                        if p['url'] == link['url'] and p['status'] == 'pending':
+                            p['status'] = 'processing'
+                            break
+                    
+                    try:
+                        result = process_single_pdf(
+                            link['url'],
+                            agent, # Pass the cached agent
+                            timeout_seconds,
+                            link['metadata']
+                        )
+                        
+                        st.session_state.extraction_results.append(result)
+                        
+                        # Update status in main list to final status
+                        for p in st.session_state.pdf_links:
+                            if p['url'] == link['url'] and p['status'] == 'processing':
+                                p['status'] = result['status']
                                 break
+                        
+                        if result['status'] == 'error' and not continue_on_error:
+                            st.error(f"❌ Stopped due to error: {result.get('error', 'Unknown error')}")
+                            st.session_state.processing = False
+                            batch_error = True
+                            break
+                        
+                    except Exception as e:
+                        error_result = {
+                            'url': link['url'], 'status': 'error',
+                            'error': f'Batch exception: {str(e)[:200]}', 'metadata': link['metadata']
+                        }
+                        st.session_state.extraction_results.append(error_result)
+                        
+                        # Update status in main list
+                        for p in st.session_state.pdf_links:
+                            if p['url'] == link['url'] and p['status'] == 'processing':
+                                p['status'] = 'error'
+                                break
+                        
+                        if not continue_on_error:
+                            st.error(f"❌ Stopped due to exception: {str(e)}")
+                            st.session_state.processing = False
+                            batch_error = True
+                            break
+                    
+                    if delay_between_requests > 0:
+                        time.sleep(delay_between_requests)
 
-                    st.success("Processing loop finished (or stopped).")
-                    st.session_state.processing = False
-                except Exception as e:
-                    st.error(f"Processing loop failed: {e}")
-                    st.session_state.processing = False
+                # --- NEW: Rerun to process the next batch ---
+                if st.session_state.processing and not batch_error:
+                    st.rerun()
+                else:
+                    # Refresh the page to show final metrics and "Start" button
+                    st.rerun()
 
-# allow clearing in non-processing state (in-memory only)
-if not st.session_state.get("processing", False):
-    if st.button("Clear session results (in-memory only)"):
-        st.session_state.pdf_links = []
-        st.session_state.extraction_results = []
-        st.success("Cleared in-memory results")
-        st.rerun()
+    if not st.session_state.processing:
+        if st.button("🗑️ Clear All Results", use_container_width=True):
+            st.session_state.pdf_links = []
+            st.session_state.extraction_results = []
+            st.session_state.processing = False
+            st.rerun()
 
-# -----------------------
-# Results display (merged persisted + in-memory)
-# -----------------------
+# Display extraction results
 if st.session_state.extraction_results:
     st.divider()
-    st.subheader("📊 Extraction Results (merged persisted + in-memory)")
-
-    merged = {}
-    persisted_list = load_persisted_results()
-    for r in persisted_list:
-        merged[r.get("url")] = r
-    for r in st.session_state.extraction_results:
-        merged[r.get("url")] = r
-    results_list = list(merged.values())
-
-    rows = []
-    for r in results_list:
-        row = {"URL": r.get("url"), "Status": "✅ Success" if r.get("status") == "success" else "❌ Error"}
-        if r.get("status") == "success":
-            data = r.get("data", {})
+    st.subheader("📊 Extraction Results")
+    
+    results_data = []
+    
+    for result in st.session_state.extraction_results:
+        row = {
+            'URL': result['url'],
+            'Status': '✅ Success' if result['status'] == 'success' else '❌ Error'
+        }
+        
+        if 'metadata' in result:
+            row.update(result['metadata'])
+        
+        if result['status'] == 'success':
+            data = result.get('data', {})
             if isinstance(data, dict):
-                for k, v in data.items():
-                    if isinstance(v, (dict, list)):
-                        row[k] = str(v)[:300]
+                for key, value in data.items():
+                    if isinstance(value, (dict, list)):
+                        row[key] = str(value)
                     else:
-                        row[k] = str(v)[:300]
+                        row[key] = value
+                
+                # ✅ Explicitly include key fields
+                row['University'] = data.get('university', '')
+                row['Company_Name'] = data.get('company_name', data.get('company', ''))
+                row['Links'] = data.get('links', '')
+
+            elif isinstance(data, list):
+                row['Extracted_Data'] = str(data)
             else:
-                row["Extracted_Data"] = str(data)[:300]
+                row['Extracted_Data'] = str(data)
         else:
-            row["Error"] = r.get("error", "")[:300]
-        meta = r.get("metadata", {})
-        for mk, mv in meta.items():
-            row[mk] = mv
-        rows.append(row)
-
-    results_df = pd.DataFrame(rows)
+            row['Error'] = result.get('error', 'Unknown error')
+        
+        results_data.append(row)
+    
+    results_df = pd.DataFrame(results_data)
+    
     st.dataframe(results_df, use_container_width=True, height=400)
-
+    
     col1, col2, col3 = st.columns(3)
+    
     with col1:
         csv = results_df.to_csv(index=False)
-        st.download_button("Download CSV", csv, file_name=f"results_{int(time.time())}.csv", mime="text/csv")
+        st.download_button(
+            label="📥 Download Results CSV",
+            data=csv,
+            file_name=f"extraction_results_{int(time.time())}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+    
     with col2:
-        json_data = json.dumps(results_list, indent=2)
-        st.download_button("Download JSON", json_data, file_name=f"results_{int(time.time())}.json", mime="application/json")
+        json_data = results_df.to_json(orient='records', indent=2)
+        st.download_button(
+            label="📥 Download Results JSON",
+            data=json_data,
+            file_name=f"extraction_results_{int(time.time())}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+    
     with col3:
-        failed_df = results_df[results_df["Status"] == "❌ Error"]
-        if not failed_df.empty:
-            failed_csv = failed_df[["URL", "Error"]].to_csv(index=False)
-            st.download_button("Download Failed URLs", failed_csv, file_name=f"failed_{int(time.time())}.csv", mime="text/csv")
-else:
-    st.info("Upload CSV and load links to start.")
+        success_df = results_df[results_df['Status'] == '✅ Success']
+        if not success_df.empty:
+            success_csv = success_df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Success Only",
+                data=success_csv,
+                file_name=f"extraction_success_{int(time.time())}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+    
+    failed_df = results_df[results_df['Status'] == '❌ Error']
+    if not failed_df.empty:
+        st.divider()
+        st.subheader("⚠️ Failed Extractions")
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.write(f"Found {len(failed_df)} failed extractions")
+            with st.expander("View Failed URLs"):
+                st.dataframe(failed_df[['URL', 'Error']], use_container_width=True)
+        with col2:
+            failed_csv = failed_df[['URL']].rename(columns={'URL': 'url'}).to_csv(index=False)
+            st.download_button(
+                label="📥 Download Failed URLs",
+                data=failed_csv,
+                file_name=f"failed_urls_{int(time.time())}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+    
+    with st.expander("🔍 View Raw Extraction Data"):
+        st.json(st.session_state.extraction_results)
+    
+    # --- This summary section is now redundant with the one at the top ---
+    # --- but we can keep it as a final summary ---
+    st.divider()
+    st.subheader("📈 Final Summary Statistics")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    success_count = len([r for r in st.session_state.extraction_results if r['status'] == 'success'])
+    error_count = len([r for r in st.session_state.extraction_results if r['status'] == 'error'])
+    total_processed = len(st.session_state.extraction_results)
+    success_rate = (success_count / total_processed * 100) if total_processed > 0 else 0
+    
+    with col1:
+        st.metric("Total Processed", total_processed)
+    with col2:
+        st.metric("Successful", success_count)
+    with col3:
+        st.metric("Failed", error_count)
+    with col4:
+        st.metric("Success Rate", f"{success_rate:.1f}%")
 
-st.caption("Concurrent extractor (fixed). Uses cached LlamaExtract agent, ThreadPoolExecutor, retries, and persistence.")
+else:
+    st.info("📋 Upload a CSV file with PDF URLs to begin extraction")
+
+# Footer
+st.divider()
+st.caption("Powered by LlamaExtract & Streamlit | Now with stable batch processing!")
