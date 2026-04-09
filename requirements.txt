@@ -3,4 +3,3 @@ pypdf
 streamlit                                                                                                             
 pandas
 requests
-llama_cloud_services
