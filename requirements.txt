@@ -1,5 +1,5 @@
-streamlit
-pandas
-llama_cloud_services
-requests
+llama-cloud>=1.0                                                                                                    
 pypdf
+streamlit                                                                                                             
+pandas
+requests
