@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from llama_cloud import LlamaExtract
+from llama_cloud_services import LlamaExtract
 from pypdf import PdfReader, PdfWriter
 import requests
 import tempfile
